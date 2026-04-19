@@ -1,0 +1,34 @@
+# Copy to config/accounts.yaml and fill in real values.
+# accounts.yaml is gitignored — secrets never hit the repo.
+#
+# Gmail users: generate an app password at
+#   https://myaccount.google.com/apppasswords
+# and use imap.gmail.com as the host.
+
+accounts:
+  - name: personal
+    type: imap
+    host: imap.gmail.com
+    port: 993
+    use_ssl: true
+    email: you@example.com
+    # Prefer env var indirection over inline passwords. Anything starting with
+    # $ is read from the environment at startup.
+    #
+    # If you inline the password, ALWAYS quote it — YAML parses bare digits as
+    # ints, drops leading zeros, and treats some tokens as bools/null:
+    #   password: "63973518"
+    password: $IMAP_PERSONAL_PASSWORD
+    folder: INBOX
+    # Only look back this far on first run. Later runs use the local db.
+    initial_lookback_days: 3
+
+  # - name: work
+  #   type: imap
+  #   host: mail.example.com
+  #   port: 993
+  #   use_ssl: true
+  #   email: work@example.com
+  #   password: $IMAP_WORK_PASSWORD
+  #   folder: INBOX
+  #   initial_lookback_days: 1

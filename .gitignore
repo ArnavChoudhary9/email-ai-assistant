@@ -1,0 +1,45 @@
+# Secrets and local state
+.env
+.env.local
+config/accounts.yaml
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Google / OAuth credentials — never commit these.
+# Default paths: config/google_client_secret.json, data/google_token.json.
+# data/ above already covers the token; these patterns cover the client
+# secret plus common variants (renames, service accounts, fallback names).
+config/google_client_secret*.json
+config/google_token*.json
+config/*service_account*.json
+config/credentials*.json
+config/client_secret*.json
+# Catch-all: any JSON inside config/ is treated as sensitive.
+config/*.json
+# Repo-root safety net in case someone drops creds alongside the code.
+google_client_secret*.json
+google_token*.json
+service_account*.json
+client_secret*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
