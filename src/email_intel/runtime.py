@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from email_intel.accounts import seed_from_yaml_if_empty
 from email_intel.config import Settings, get_settings
+from email_intel.storage.migrate import run_migrations
 from email_intel.integrations.google_calendar import (
     GoogleCalendarClient,
     build_calendar_client,
@@ -43,6 +44,9 @@ def build_runtime(settings: Settings | None = None) -> RuntimeContext:
     cipher = FernetCipher(settings.app_encryption_key.get_secret_value())
     engine = make_engine(settings.email_intel_db_path)
     session_factory = make_session_factory(engine)
+
+    # Apply in-place migrations (adds owner_chat_id cols, backfills to bot owner).
+    run_migrations(engine, session_factory)
 
     seeded = seed_from_yaml_if_empty(
         session_factory, cipher, settings.email_intel_accounts_path

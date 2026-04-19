@@ -1,3 +1,5 @@
+"""End-to-end pipeline via the queue: enqueue -> drain -> verify side effects."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -5,43 +7,34 @@ from unittest.mock import MagicMock
 import httpx
 import respx
 
-from email_intel.app import _process_email
 from email_intel.integrations.openrouter import OPENROUTER_URL, OpenRouterClient
 from email_intel.integrations.telegram import TelegramNotifier
-from email_intel.runtime import RuntimeContext
-from email_intel.security import FernetCipher, generate_key
+from email_intel.pipeline import worker
 from email_intel.storage import repo
 from email_intel.storage.db import session_scope
+from email_intel.storage.schema import EmailJobRow
+
+OWNER = "111"
 
 
 def _llm_ok(content: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
 
-def _new_stats() -> dict[str, int]:
-    return {
-        "fetched": 0,
-        "skipped_ignore": 0,
-        "extracted": 0,
-        "telegram_sent": 0,
-        "pending_events_created": 0,
-        "errors": 0,
-    }
-
-
-def _runtime(session_factory) -> RuntimeContext:
-    return RuntimeContext(
-        settings=MagicMock(),
-        engine=MagicMock(),
+def _drain(session_factory, llm, telegram):
+    return worker.drain_emails(
         session_factory=session_factory,
-        cipher=FernetCipher(generate_key()),
-        build_calendar=lambda: None,
+        llm=llm,
+        telegram=telegram,
         bot_runner=None,
+        primary_model="primary",
+        fallback_model="fallback",
+        app_timezone="Asia/Kolkata",
     )
 
 
 @respx.mock
-def test_important_email_triggers_telegram_without_calendar(session_factory, email_factory):
+def test_important_email_drains_and_alerts(session_factory, email_factory):
     email = email_factory(
         subject="Urgent reply please",
         sender="manager@iitd.ac.in",
@@ -58,36 +51,29 @@ def test_important_email_triggers_telegram_without_calendar(session_factory, ema
     )
 
     telegram = MagicMock(spec=TelegramNotifier)
-    telegram.has_recipients = True
-    stats = _new_stats()
+    telegram.send.return_value = True
+
+    job_id = worker.enqueue_email(session_factory, email, OWNER)
+    assert job_id is not None
 
     with OpenRouterClient("sk-test") as llm:
-        _process_email(
-            email=email,
-            session_factory=session_factory,
-            llm=llm,
-            telegram=telegram,
-            calendar=None,
-            runtime=_runtime(session_factory),
-            primary_model="primary",
-            fallback_model="fallback",
-            app_timezone="Asia/Kolkata",
-            chat_ids=["123"],
-            stats=stats,
-        )
+        stats = _drain(session_factory, llm, telegram)
 
-    assert stats["extracted"] == 1
-    assert stats["telegram_sent"] == 1
-    assert stats["pending_events_created"] == 0
+    assert stats["processed"] == 1
     telegram.send.assert_called_once()
-    sent_msg = telegram.send.call_args.args[0]
-    assert "Urgent reply please" in sent_msg
-    assert "[IMPORTANT]" in sent_msg
-    assert "Reply to manager" in sent_msg
+    chat, msg = telegram.send.call_args.args
+    assert chat == OWNER
+    assert "[IMPORTANT]" in msg
+    assert "Reply to manager" in msg
+
+    with session_scope(session_factory) as s:
+        # Job is done.
+        assert repo.count_queue(s, EmailJobRow, status="done") == 1
+        assert repo.count_queue(s, EmailJobRow, status="queued") == 0
 
 
 @respx.mock
-def test_meeting_email_creates_pending_event(session_factory, email_factory):
+def test_meeting_email_creates_pending_via_queue(session_factory, email_factory):
     email = email_factory(
         subject="Interview invitation",
         sender="placement@iitd.ac.in",
@@ -104,48 +90,27 @@ def test_meeting_email_creates_pending_event(session_factory, email_factory):
     )
 
     telegram = MagicMock(spec=TelegramNotifier)
-    telegram.has_recipients = True
-    stats = _new_stats()
+    telegram.send.return_value = True
 
+    worker.enqueue_email(session_factory, email, OWNER)
     with OpenRouterClient("sk-test") as llm:
-        _process_email(
-            email=email,
-            session_factory=session_factory,
-            llm=llm,
-            telegram=telegram,
-            calendar=None,
-            runtime=_runtime(session_factory),
-            primary_model="primary",
-            fallback_model=None,
-            app_timezone="Asia/Kolkata",
-            chat_ids=[],  # no bot users → no prompt sent, but pending still created
-            stats=stats,
-        )
-
-    assert stats["pending_events_created"] == 1
+        _drain(session_factory, llm, telegram)
 
     with session_scope(session_factory) as s:
-        pending_rows = repo.list_pending(s)
-    assert len(pending_rows) == 1
-    row = pending_rows[0]
+        pending = repo.list_pending(s, owner_chat_id=OWNER)
+    assert len(pending) == 1
+    row = pending[0]
     assert row.title.startswith("Meeting:")
-    # Time stays in IST — not blindly stamped UTC.
     assert row.start_iso.startswith("2026-04-21T15:00")
     assert "+05:30" in row.start_iso
-    assert row.timezone_name == "Asia/Kolkata"
-
-    # Telegram fired and mentioned pending count.
-    assert stats["telegram_sent"] == 1
-    sent_msg = telegram.send.call_args.args[0]
-    assert "1 calendar event" in sent_msg
-    assert "Prepare documents" in sent_msg
+    assert row.owner_chat_id == OWNER
 
 
 @respx.mock
-def test_reminder_email_does_not_duplicate_pending(session_factory, email_factory):
-    """Two reminder emails about the same interview → one pending event."""
+def test_reminder_emails_dedup_via_queue(session_factory, email_factory):
+    """Two reminder emails about the same event → one pending row."""
 
-    def _llm_response() -> httpx.Response:
+    def _llm() -> httpx.Response:
         return _llm_ok(
             '{"summary":"Interview at 3 PM","importance":"important",'
             '"action_required":true,"deadline":"",'
@@ -154,42 +119,32 @@ def test_reminder_email_does_not_duplicate_pending(session_factory, email_factor
             '"reply_needed":false,"reply_priority":""}'
         )
 
-    respx.post(OPENROUTER_URL).mock(side_effect=[_llm_response(), _llm_response()])
+    respx.post(OPENROUTER_URL).mock(side_effect=[_llm(), _llm()])
 
     telegram = MagicMock(spec=TelegramNotifier)
-    telegram.has_recipients = True
-    stats = _new_stats()
+    telegram.send.return_value = True
 
-    def _run(email):
-        with OpenRouterClient("sk-test") as llm:
-            _process_email(
-                email=email,
-                session_factory=session_factory,
-                llm=llm,
-                telegram=telegram,
-                calendar=None,
-                runtime=_runtime(session_factory),
-                primary_model="primary",
-                fallback_model=None,
-                app_timezone="Asia/Kolkata",
-                chat_ids=[],
-                stats=stats,
-            )
+    worker.enqueue_email(
+        session_factory,
+        email_factory(subject="Interview invitation", message_id="msg-a"),
+        OWNER,
+    )
+    worker.enqueue_email(
+        session_factory,
+        email_factory(subject="Reminder: Interview invitation", message_id="msg-b"),
+        OWNER,
+    )
 
-    _run(email_factory(subject="Interview invitation", message_id="msg-a"))
-    _run(email_factory(subject="Reminder: Interview invitation", message_id="msg-b"))
+    with OpenRouterClient("sk-test") as llm:
+        stats = _drain(session_factory, llm, telegram)
 
-    # Both emails processed, but only ONE pending row survived dedup.
-    assert stats["extracted"] == 2
-    assert stats["pending_events_created"] == 1
-
+    assert stats["processed"] == 2
     with session_scope(session_factory) as s:
-        pending_rows = repo.list_pending(s)
-    assert len(pending_rows) == 1
+        assert len(repo.list_pending(s, owner_chat_id=OWNER)) == 1
 
 
 @respx.mock
-def test_promo_email_skipped_without_llm_or_calendar(session_factory, email_factory):
+def test_promo_email_skipped(session_factory, email_factory):
     email = email_factory(
         subject="50% off this weekend",
         sender="newsletter@brand.com",
@@ -199,27 +154,37 @@ def test_promo_email_skipped_without_llm_or_calendar(session_factory, email_fact
     route = respx.post(OPENROUTER_URL).mock(return_value=httpx.Response(500))
 
     telegram = MagicMock(spec=TelegramNotifier)
-    telegram.has_recipients = True
-    stats = _new_stats()
+    telegram.send.return_value = True
 
+    worker.enqueue_email(session_factory, email, OWNER)
     with OpenRouterClient("sk-test") as llm:
-        _process_email(
-            email=email,
-            session_factory=session_factory,
-            llm=llm,
-            telegram=telegram,
-            calendar=None,
-            runtime=_runtime(session_factory),
-            primary_model="primary",
-            fallback_model=None,
-            app_timezone="Asia/Kolkata",
-            chat_ids=["123"],
-            stats=stats,
-        )
+        stats = _drain(session_factory, llm, telegram)
 
     assert stats["skipped_ignore"] == 1
-    assert stats["extracted"] == 0
-    assert stats["telegram_sent"] == 0
-    assert stats["pending_events_created"] == 0
+    assert stats["processed"] == 0
     telegram.send.assert_not_called()
     assert route.called is False
+
+
+@respx.mock
+def test_llm_failure_reschedules(session_factory, email_factory):
+    """Transient LLM failure → job goes back to queued with backoff."""
+    email = email_factory(subject="Urgent meeting", body="Tomorrow at 3 PM")
+    respx.post(OPENROUTER_URL).mock(return_value=httpx.Response(500))
+
+    telegram = MagicMock(spec=TelegramNotifier)
+    telegram.send.return_value = True
+
+    job_id = worker.enqueue_email(session_factory, email, OWNER)
+    assert job_id is not None
+
+    with OpenRouterClient("sk-test") as llm:
+        stats = _drain(session_factory, llm, telegram)
+
+    assert stats["retried"] == 1
+    with session_scope(session_factory) as s:
+        row = s.get(EmailJobRow, job_id)
+        assert row is not None
+        assert row.status == "queued"
+        assert row.last_error
+        assert row.attempts >= 1

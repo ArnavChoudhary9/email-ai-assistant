@@ -45,7 +45,6 @@ from telegram.ext import (
 
 from email_intel.config import IMAPAccount, Settings
 from email_intel.integrations.google_calendar import GoogleCalendarClient
-from email_intel.pipeline import pending as pending_mod
 from email_intel.providers.imap import IMAPProvider
 from email_intel.security import FernetCipher
 from email_intel.storage import repo
@@ -77,10 +76,19 @@ def _ctx(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
 # ---------------------------------------------------------------------------
 
 
-async def _require_auth(update: Update, ctx: BotContext) -> bool:
-    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+def _caller_chat_id(update: Update) -> str:
+    return str(update.effective_chat.id) if update.effective_chat else ""
+
+
+async def _require_auth(update: Update, ctx: BotContext) -> str | None:
+    """Enforce authorization and return the caller's chat_id (string).
+
+    Returns None if the caller isn't authorized; the reply to that effect is
+    sent here so callers can just `if not chat_id: return`.
+    """
+    chat_id = _caller_chat_id(update)
     if not chat_id:
-        return False
+        return None
     with session_scope(ctx.session_factory) as s:
         row = repo.get_bot_user(s, chat_id)
         if row is None or not row.is_authorized:
@@ -89,8 +97,8 @@ async def _require_auth(update: Update, ctx: BotContext) -> bool:
                     "This chat isn't authorized. Ask the owner to /authorize "
                     f"{chat_id}, or the owner can send /start first."
                 )
-            return False
-    return True
+            return None
+    return chat_id
 
 
 # ---------------------------------------------------------------------------
@@ -163,31 +171,34 @@ async def cmd_authorize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     await update.effective_message.reply_text(
         "Commands:\n"
-        "/accounts — list email accounts\n"
+        "/accounts — list your email accounts\n"
         "/add_account — add a new IMAP account\n"
         "/remove_account <name>\n"
         "/test_account <name>\n"
-        "/pending — events waiting for approval\n"
-        "/status — health\n"
+        "/pending — your events waiting for approval\n"
+        "/status — your health\n"
+        "/revoke <chat_id> — (owner only) de-authorize a chat and delete their accounts\n"
         "/cancel — abort the current conversation"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     with session_scope(ctx.session_factory) as s:
-        accounts = repo.list_accounts(s, enabled_only=False)
-        pending_rows = repo.list_pending(s)
+        accounts = repo.list_accounts(s, enabled_only=False, owner_chat_id=caller)
+        pending_rows = repo.list_pending(s, owner_chat_id=caller)
     healthy = sum(1 for a in accounts if a.enabled and not a.last_error)
     await update.effective_message.reply_text(
-        f"Accounts: {healthy}/{len(accounts)} healthy\n"
-        f"Pending events: {len(pending_rows)}\n"
+        f"Your accounts: {healthy}/{len(accounts)} healthy\n"
+        f"Your pending events: {len(pending_rows)}\n"
         f"Timezone: {ctx.settings.app_timezone}"
     )
 
@@ -199,16 +210,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     with session_scope(ctx.session_factory) as s:
-        accounts = repo.list_accounts(s, enabled_only=False)
+        accounts = repo.list_accounts(s, enabled_only=False, owner_chat_id=caller)
     if not accounts:
         await update.effective_message.reply_text(
             "No accounts yet. Use /add_account to add one."
         )
         return
-    lines = ["Accounts:"]
+    lines = ["Your accounts:"]
     for a in accounts:
         status = "✓" if a.enabled and not a.last_error else ("✗" if a.last_error else "•")
         last_ok = a.last_success_at.isoformat() if a.last_success_at else "never"
@@ -220,14 +232,15 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_remove_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     if not context.args:
         await update.effective_message.reply_text("Usage: /remove_account <name>")
         return
     name = context.args[0]
     with session_scope(ctx.session_factory) as s:
-        ok = repo.delete_account(s, name)
+        ok = repo.delete_account(s, name, owner_chat_id=caller)
     await update.effective_message.reply_text(
         f"Removed account {name}." if ok else f"No such account: {name}."
     )
@@ -235,7 +248,8 @@ async def cmd_remove_account(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def cmd_test_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     if not context.args:
         await update.effective_message.reply_text("Usage: /test_account <name>")
@@ -243,7 +257,7 @@ async def cmd_test_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     name = context.args[0]
 
     with session_scope(ctx.session_factory) as s:
-        row = repo.get_account_by_name(s, name)
+        row = repo.get_account_by_name(s, name, owner_chat_id=caller)
         if row is None:
             await update.effective_message.reply_text(f"No such account: {name}.")
             return
@@ -273,12 +287,12 @@ async def cmd_test_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await asyncio.to_thread(_probe)
     except Exception as e:
         with session_scope(ctx.session_factory) as s:
-            repo.mark_account_error(s, name, str(e))
+            repo.mark_account_error(s, name, str(e), owner_chat_id=caller)
         await update.effective_message.reply_text(f"Login failed: {e}")
         return
 
     with session_scope(ctx.session_factory) as s:
-        repo.mark_account_success(s, name)
+        repo.mark_account_success(s, name, owner_chat_id=caller)
     await update.effective_message.reply_text(f"Login to {name} succeeded.")
 
 
@@ -289,9 +303,11 @@ async def cmd_test_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return ConversationHandler.END
     context.user_data.clear()  # type: ignore[union-attr]
+    context.user_data["owner_chat_id"] = caller  # type: ignore[index]
     await update.effective_message.reply_text(
         "Adding a new IMAP account. Send /cancel any time.\n\n"
         "IMAP host? (e.g. mailstore.iitd.ac.in or imap.gmail.com)"
@@ -366,16 +382,21 @@ async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     data = context.user_data  # type: ignore[assignment]
     if not data:
         return ConversationHandler.END
+    owner = data.get("owner_chat_id")
+    if not owner:
+        await update.message.reply_text("Session expired. Start over with /add_account.")
+        return ConversationHandler.END
 
     with session_scope(ctx.session_factory) as s:
-        if repo.get_account_by_name(s, name) is not None:
+        if repo.get_account_by_name(s, name, owner_chat_id=owner) is not None:
             await update.message.reply_text(
-                f"Account {name!r} already exists. Pick a different name."
+                f"You already have an account named {name!r}. Pick a different name."
             )
             return ADD_NAME
         repo.insert_account(
             s,
             name=name,
+            owner_chat_id=owner,
             host=data["host"],
             port=data["port"],
             use_ssl=data["use_ssl"],
@@ -426,10 +447,11 @@ def _format_prompt(row: PendingEventRow) -> str:
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
-    if not await _require_auth(update, ctx) or not update.effective_message:
+    caller = await _require_auth(update, ctx)
+    if not caller or not update.effective_message:
         return
     with session_scope(ctx.session_factory) as s:
-        rows = repo.list_pending(s)
+        rows = repo.list_pending(s, owner_chat_id=caller)
         snapshot = [
             {
                 "id": r.id,
@@ -457,6 +479,48 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text(text, reply_markup=kb)
 
 
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: de-authorize a chat and hard-delete all their accounts."""
+    ctx = _ctx(context)
+    if not update.effective_message:
+        return
+    chat_id = _caller_chat_id(update)
+    if not chat_id:
+        return
+
+    with session_scope(ctx.session_factory) as s:
+        caller = repo.get_bot_user(s, chat_id)
+        if caller is None or not caller.is_owner:
+            await update.effective_message.reply_text("Only the owner can revoke chats.")
+            return
+        if not context.args:
+            await update.effective_message.reply_text("Usage: /revoke <chat_id>")
+            return
+        target = context.args[0]
+        if target == chat_id:
+            await update.effective_message.reply_text(
+                "Refusing to revoke yourself — you're the owner."
+            )
+            return
+        target_row = repo.get_bot_user(s, target)
+        if target_row is None:
+            await update.effective_message.reply_text(f"No such chat: {target}.")
+            return
+        deleted = repo.delete_accounts_for_chat(s, target)
+        target_row.is_authorized = False
+
+    await update.effective_message.reply_text(
+        f"Revoked chat {target}. Deleted {deleted} account(s)."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text="Your access has been revoked and your accounts were deleted.",
+        )
+    except Exception:
+        log.debug("Couldn't notify revoked chat %s (it may have blocked the bot)", target)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     query = update.callback_query
@@ -469,6 +533,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pending_id = int(pid_str)
     except ValueError:
         return
+
+    # Ownership check: only the user who owns this pending event can decide.
+    caller_chat_id = (
+        str(update.effective_chat.id) if update.effective_chat else ""
+    )
+    with session_scope(ctx.session_factory) as s:
+        row = repo.get_pending(s, pending_id)
+        if row is None:
+            await query.edit_message_text("This prompt is stale — pending event not found.")
+            return
+        if row.owner_chat_id and row.owner_chat_id != caller_chat_id:
+            # Silent refusal via toast — don't reveal another user's data.
+            await query.answer("Not your prompt.", show_alert=True)
+            return
 
     if action == "approve":
         await _approve(ctx, query, pending_id)
@@ -483,8 +561,7 @@ async def _reject(ctx: BotContext, query: Any, pending_id: int) -> None:
 
 
 async def _approve(ctx: BotContext, query: Any, pending_id: int) -> None:
-    # Fetch the serialized event body under a short-lived session so we don't
-    # hold a DB connection across the Google API network call.
+    """Queue the GCal insert. A worker picks it up on the next scheduler tick."""
     with session_scope(ctx.session_factory) as s:
         row = repo.get_pending(s, pending_id)
         if row is None:
@@ -495,43 +572,15 @@ async def _approve(ctx: BotContext, query: Any, pending_id: int) -> None:
                 f"Already {row.status}. No action taken."
             )
             return
-        body = pending_mod.event_body(row)
-        title = row.title
-        email_id = row.email_id
-        fingerprint = row.fingerprint
-
-    calendar: GoogleCalendarClient | None = ctx.build_calendar()
-    if calendar is None:
-        with session_scope(ctx.session_factory) as s:
-            repo.mark_pending_status(
-                s, pending_id, "failed", error="Google Calendar not configured"
-            )
-        await query.edit_message_text(
-            f"{query.message.text}\n\n⚠️ Google Calendar not configured. "
-            "Set GOOGLE_CLIENT_SECRETS_PATH in .env."
-        )
-        return
-
-    try:
-        result = await asyncio.to_thread(calendar.insert_event, body)
-    except Exception as e:
-        log.exception("Calendar insert failed for pending_id=%s", pending_id)
-        with session_scope(ctx.session_factory) as s:
-            repo.mark_pending_status(s, pending_id, "failed", error=str(e))
-        await query.edit_message_text(f"{query.message.text}\n\n⚠️ Create failed: {e}")
-        return
-
-    event_id = result.get("id") if isinstance(result, dict) else None
-    with session_scope(ctx.session_factory) as s:
-        repo.mark_pending_status(
-            s, pending_id, "created", google_event_id=event_id
-        )
-        repo.record_calendar_event(
-            s, email_id=email_id, google_event_id=event_id, fingerprint=fingerprint
+        # Mark approved and enqueue. The worker owns the GCal insert, so the
+        # bot thread stays responsive and transient errors retry.
+        row.status = "approved"
+        repo.enqueue_event_job(
+            s, pending_event_id=pending_id, owner_chat_id=row.owner_chat_id
         )
 
     await query.edit_message_text(
-        f"{query.message.text}\n\n✅ Created: {title} (id={event_id})"
+        f"{query.message.text}\n\n⏳ Queued — creating in the background."
     )
 
 
@@ -565,6 +614,7 @@ def _build_application(bot_ctx: BotContext) -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("authorize", cmd_authorize))
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("remove_account", cmd_remove_account))
     app.add_handler(CommandHandler("test_account", cmd_test_account))
@@ -627,6 +677,37 @@ class BotRunner:
             log.exception("Failed to send pending prompt to %s", chat_id)
             return None
         return str(msg.message_id)
+
+    def edit_pending_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        *,
+        timeout: float = 30.0,
+    ) -> bool:
+        """Edit a previously-sent prompt from the worker thread.
+
+        Used by drain_events to update "⏳ Queued…" to "✅ Created …" once the
+        GCal insert succeeds. Best-effort — returns False if we can't reach
+        the message (deleted, too old, bot blocked).
+        """
+        if self._loop is None or self._app is None:
+            return False
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return False
+        coro = self._app.bot.edit_message_text(
+            chat_id=chat_id, message_id=mid, text=text
+        )
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            fut.result(timeout=timeout)
+        except Exception:
+            log.debug("Couldn't edit message %s in chat %s", message_id, chat_id)
+            return False
+        return True
 
     # internal --------------------------------------------------------------
 

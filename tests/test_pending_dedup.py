@@ -31,12 +31,13 @@ def test_two_emails_same_event_produce_one_pending(session_factory, email_factor
 
     def _process(email):
         with session_scope(session_factory) as s:
-            row = repo.insert_email(s, email)
+            row = repo.insert_email(s, email, owner_chat_id="1001")
             return calendar_stage.propose_events_for_email(
                 session=s,
                 email_row=row,
                 email=email,
                 extraction=extraction,
+                owner_chat_id="1001",
                 app_timezone="Asia/Kolkata",
             )
 

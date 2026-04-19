@@ -10,7 +10,9 @@ from email_intel.storage.schema import (
     AccountRow,
     BotUserRow,
     CalendarEventRow,
+    EmailJobRow,
     EmailRow,
+    EventJobRow,
     NotificationRow,
     PendingEventRow,
     TaskRow,
@@ -25,15 +27,19 @@ def is_seen(session: Session, provider: str, message_id: str, raw_hash: str) -> 
     return session.execute(stmt).first() is not None
 
 
-def insert_email(session: Session, email: Email) -> EmailRow:
+def insert_email(
+    session: Session, email: Email, *, owner_chat_id: str | None = None
+) -> EmailRow:
     row = EmailRow(
         provider=email.provider,
         account_name=email.account_name,
+        owner_chat_id=owner_chat_id,
         message_id=email.message_id,
         sender=email.sender,
         subject=email.subject,
         received_at=email.received_at,
         raw_hash=email.raw_hash,
+        body_text=email.body_text,
         processed=False,
     )
     session.add(row)
@@ -116,15 +122,28 @@ def count_calendar_events_for_email(session: Session, email_id: int) -> int:
 # --- Accounts -------------------------------------------------------------
 
 
-def list_accounts(session: Session, enabled_only: bool = True) -> list[AccountRow]:
+def list_accounts(
+    session: Session,
+    enabled_only: bool = True,
+    *,
+    owner_chat_id: str | None = None,
+) -> list[AccountRow]:
     stmt = select(AccountRow)
     if enabled_only:
         stmt = stmt.where(AccountRow.enabled == True)  # noqa: E712
+    if owner_chat_id is not None:
+        stmt = stmt.where(AccountRow.owner_chat_id == owner_chat_id)
     return list(session.execute(stmt).scalars().all())
 
 
-def get_account_by_name(session: Session, name: str) -> AccountRow | None:
+def get_account_by_name(
+    session: Session, name: str, *, owner_chat_id: str | None = None
+) -> AccountRow | None:
+    """Look up an account by name. When owner_chat_id is given, the row must
+    also belong to that chat — mismatches return None (same UX as not found)."""
     stmt = select(AccountRow).where(AccountRow.name == name)
+    if owner_chat_id is not None:
+        stmt = stmt.where(AccountRow.owner_chat_id == owner_chat_id)
     return session.execute(stmt).scalar_one_or_none()
 
 
@@ -132,6 +151,7 @@ def insert_account(
     session: Session,
     *,
     name: str,
+    owner_chat_id: str,
     host: str,
     port: int,
     use_ssl: bool,
@@ -142,6 +162,7 @@ def insert_account(
 ) -> AccountRow:
     row = AccountRow(
         name=name,
+        owner_chat_id=owner_chat_id,
         type="imap",
         host=host,
         port=port,
@@ -157,23 +178,37 @@ def insert_account(
     return row
 
 
-def delete_account(session: Session, name: str) -> bool:
-    row = get_account_by_name(session, name)
+def delete_account(
+    session: Session, name: str, *, owner_chat_id: str | None = None
+) -> bool:
+    row = get_account_by_name(session, name, owner_chat_id=owner_chat_id)
     if row is None:
         return False
     session.delete(row)
     return True
 
 
-def mark_account_success(session: Session, name: str) -> None:
-    row = get_account_by_name(session, name)
+def delete_accounts_for_chat(session: Session, owner_chat_id: str) -> int:
+    """Hard-delete every account owned by this chat. Returns rows removed."""
+    rows = list_accounts(session, enabled_only=False, owner_chat_id=owner_chat_id)
+    for r in rows:
+        session.delete(r)
+    return len(rows)
+
+
+def mark_account_success(
+    session: Session, name: str, *, owner_chat_id: str | None = None
+) -> None:
+    row = get_account_by_name(session, name, owner_chat_id=owner_chat_id)
     if row is not None:
         row.last_success_at = datetime.now(UTC)
         row.last_error = None
 
 
-def mark_account_error(session: Session, name: str, err: str) -> None:
-    row = get_account_by_name(session, name)
+def mark_account_error(
+    session: Session, name: str, err: str, *, owner_chat_id: str | None = None
+) -> None:
+    row = get_account_by_name(session, name, owner_chat_id=owner_chat_id)
     if row is not None:
         row.last_error = err[:2000]
 
@@ -236,8 +271,17 @@ def list_authorized_chat_ids(session: Session) -> list[str]:
 # --- Pending events -------------------------------------------------------
 
 
-def find_pending_by_fingerprint(session: Session, fingerprint: str) -> PendingEventRow | None:
+def find_pending_by_fingerprint(
+    session: Session, fingerprint: str, *, owner_chat_id: str | None = None
+) -> PendingEventRow | None:
+    """Find a pending event by fingerprint, scoped to a specific owner.
+
+    Scoping means two different users with the same event in their inboxes
+    each get their own prompt — we don't cross-pollinate.
+    """
     stmt = select(PendingEventRow).where(PendingEventRow.fingerprint == fingerprint)
+    if owner_chat_id is not None:
+        stmt = stmt.where(PendingEventRow.owner_chat_id == owner_chat_id)
     return session.execute(stmt).scalar_one_or_none()
 
 
@@ -245,6 +289,7 @@ def insert_pending_event(
     session: Session,
     *,
     email_id: int,
+    owner_chat_id: str | None,
     fingerprint: str,
     title: str,
     start_iso: str,
@@ -254,6 +299,7 @@ def insert_pending_event(
 ) -> PendingEventRow:
     row = PendingEventRow(
         email_id=email_id,
+        owner_chat_id=owner_chat_id,
         fingerprint=fingerprint,
         title=title,
         start_iso=start_iso,
@@ -271,8 +317,12 @@ def get_pending(session: Session, pending_id: int) -> PendingEventRow | None:
     return session.get(PendingEventRow, pending_id)
 
 
-def list_pending(session: Session) -> list[PendingEventRow]:
+def list_pending(
+    session: Session, *, owner_chat_id: str | None = None
+) -> list[PendingEventRow]:
     stmt = select(PendingEventRow).where(PendingEventRow.status == "pending")
+    if owner_chat_id is not None:
+        stmt = stmt.where(PendingEventRow.owner_chat_id == owner_chat_id)
     return list(session.execute(stmt).scalars().all())
 
 
@@ -303,3 +353,148 @@ def mark_pending_status(
     if error:
         row.last_error = error[:2000]
     return row
+
+
+# --- Queue helpers --------------------------------------------------------
+#
+# Two durable job queues live in SQLite: email_jobs (fetch->process) and
+# event_jobs (approve->GCal insert). Each job row has a lease-like state
+# machine: queued -> processing (with locked_at/locked_by) -> done | failed.
+# Stale locks age out so a crashed worker's jobs get re-claimed.
+
+
+from datetime import timedelta  # noqa: E402
+
+
+def enqueue_email_job(
+    session: Session, *, email_id: int, owner_chat_id: str | None
+) -> EmailJobRow:
+    row = EmailJobRow(
+        email_id=email_id,
+        owner_chat_id=owner_chat_id,
+        status="queued",
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def enqueue_event_job(
+    session: Session, *, pending_event_id: int, owner_chat_id: str | None
+) -> EventJobRow:
+    row = EventJobRow(
+        pending_event_id=pending_event_id,
+        owner_chat_id=owner_chat_id,
+        status="queued",
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _claim_next(
+    session: Session, model, worker_id: str, *, stale_after_sec: int = 600
+):  # type: ignore[no-untyped-def]
+    """Atomically pick the oldest runnable job and mark it processing.
+
+    Runnable = `queued` with `next_run_at <= now`, OR `processing` whose
+    `locked_at` is older than `stale_after_sec` (crashed worker).
+    """
+    now = datetime.now(UTC)
+    stale_cutoff = now - timedelta(seconds=stale_after_sec)
+
+    # Claim queued or stale-processing rows. Use explicit WHERE and a single
+    # UPDATE with RETURNING would be ideal, but SQLite's support is uneven;
+    # instead we do a pick-then-update inside the open transaction.
+    stmt = (
+        select(model)
+        .where(
+            (
+                (model.status == "queued") & (model.next_run_at <= now)
+            )
+            | (
+                (model.status == "processing") & (model.locked_at < stale_cutoff)
+            )
+        )
+        .order_by(model.next_run_at.asc())
+        .limit(1)
+    )
+    row = session.execute(stmt).scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "processing"
+    row.locked_at = now
+    row.locked_by = worker_id
+    row.attempts = row.attempts + 1
+    session.flush()
+    return row
+
+
+def claim_next_email_job(
+    session: Session, worker_id: str, *, stale_after_sec: int = 600
+) -> EmailJobRow | None:
+    return _claim_next(session, EmailJobRow, worker_id, stale_after_sec=stale_after_sec)
+
+
+def claim_next_event_job(
+    session: Session, worker_id: str, *, stale_after_sec: int = 600
+) -> EventJobRow | None:
+    return _claim_next(session, EventJobRow, worker_id, stale_after_sec=stale_after_sec)
+
+
+def mark_job_done(session: Session, model, job_id: int) -> None:  # type: ignore[no-untyped-def]
+    row = session.get(model, job_id)
+    if row is None:
+        return
+    row.status = "done"
+    row.locked_at = None
+    row.locked_by = None
+
+
+def mark_job_failed(
+    session: Session,
+    model,  # type: ignore[no-untyped-def]
+    job_id: int,
+    *,
+    error: str,
+) -> None:
+    row = session.get(model, job_id)
+    if row is None:
+        return
+    row.status = "failed"
+    row.locked_at = None
+    row.locked_by = None
+    row.last_error = error[:2000]
+
+
+def reschedule_job(
+    session: Session,
+    model,  # type: ignore[no-untyped-def]
+    job_id: int,
+    *,
+    error: str,
+    backoff_seconds: int,
+) -> None:
+    row = session.get(model, job_id)
+    if row is None:
+        return
+    row.status = "queued"
+    row.locked_at = None
+    row.locked_by = None
+    row.last_error = error[:2000]
+    row.next_run_at = datetime.now(UTC) + timedelta(seconds=backoff_seconds)
+
+
+def count_queue(
+    session: Session,
+    model,  # type: ignore[no-untyped-def]
+    *,
+    status: str | None = None,
+    owner_chat_id: str | None = None,
+) -> int:
+    stmt = select(model.id)
+    if status is not None:
+        stmt = stmt.where(model.status == status)
+    if owner_chat_id is not None:
+        stmt = stmt.where(model.owner_chat_id == owner_chat_id)
+    return len(list(session.execute(stmt).all()))

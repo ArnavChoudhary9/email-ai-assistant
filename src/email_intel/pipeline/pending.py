@@ -58,6 +58,7 @@ def propose(
     session: Session,
     *,
     email_id: int,
+    owner_chat_id: str | None,
     title: str,
     start_iso: str,
     end_iso: str,
@@ -66,25 +67,26 @@ def propose(
 ) -> tuple[PendingEventRow, bool]:
     """Insert a pending-event row for this proposed calendar event.
 
-    Returns (row, is_new). If a row with the same fingerprint already exists
-    (regardless of status) we return the existing row with is_new=False — so
-    repeated reminder emails don't spawn duplicate prompts or calendar events.
+    Dedup is scoped per owner_chat_id — two different users seeing the same
+    event in their own inboxes each get their own prompt.
     """
     fp = compute_fingerprint(title, start_iso)
-    existing = repo.find_pending_by_fingerprint(session, fp)
+    existing = repo.find_pending_by_fingerprint(session, fp, owner_chat_id=owner_chat_id)
     if existing is not None:
         log.info(
-            "Pending event dedup hit: fingerprint=%s existing_id=%s status=%s title=%r",
+            "Pending event dedup hit: fingerprint=%s existing_id=%s status=%s title=%r owner=%s",
             fp,
             existing.id,
             existing.status,
             title,
+            owner_chat_id,
         )
         return existing, False
 
     row = repo.insert_pending_event(
         session=session,
         email_id=email_id,
+        owner_chat_id=owner_chat_id,
         fingerprint=fp,
         title=title,
         start_iso=start_iso,

@@ -95,12 +95,13 @@ def propose_events_for_email(
     email_row: EmailRow,
     email: Email,
     extraction: Extraction,
+    owner_chat_id: str | None = None,
     app_timezone: str = "Asia/Kolkata",
 ) -> list[PendingEventRow]:
     """Create pending-event rows for this email; return only the NEW ones.
 
-    Rows that dedup against existing fingerprints are skipped (not returned),
-    so the caller only prompts the user about genuinely new events.
+    Rows that dedup against existing fingerprints (within the same owner
+    scope) are skipped. Each owner gets an independent prompt.
     """
     bodies = build_events(email, extraction, app_timezone=app_timezone)
     if not bodies:
@@ -114,6 +115,7 @@ def propose_events_for_email(
         row, is_new = pending.propose(
             session,
             email_id=email_row.id,
+            owner_chat_id=owner_chat_id,
             title=title,
             start_iso=start_iso,
             end_iso=end_iso,
