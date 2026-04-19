@@ -32,12 +32,10 @@ class RedactFilter(logging.Filter):
 
 def _collect_secrets(settings: Settings) -> list[str]:
     values: list[str] = []
-    for attr in ("openrouter_api_key", "telegram_bot_token"):
+    for attr in ("openrouter_api_key", "telegram_bot_token", "app_encryption_key"):
         v = getattr(settings, attr, None)
         if isinstance(v, SecretStr):
             values.append(v.get_secret_value())
-    for account in settings.accounts:
-        values.append(account.password.get_secret_value())
     return values
 
 
@@ -55,11 +53,7 @@ def setup_logging(settings: Settings, level: int = logging.INFO) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    try:
-        secrets = _collect_secrets(settings)
-    except FileNotFoundError:
-        # Accounts file may not exist yet (e.g. during tests). That's fine.
-        secrets = []
+    secrets = _collect_secrets(settings)
     redact = RedactFilter(secrets)
 
     stream = logging.StreamHandler()

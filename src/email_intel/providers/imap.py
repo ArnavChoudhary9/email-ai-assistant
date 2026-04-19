@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from imap_tools import AND, MailBox, MailBoxUnencrypted
 from imap_tools.message import MailMessage
@@ -53,7 +53,7 @@ class IMAPProvider(BaseEmailProvider):
 
     def fetch_new(self, since: datetime | None = None) -> Iterator[Email]:
         if since is None:
-            since = datetime.now(timezone.utc) - timedelta(days=self.account.initial_lookback_days)
+            since = datetime.now(UTC) - timedelta(days=self.account.initial_lookback_days)
         # IMAP SINCE is date-granular.
         since_date = since.date()
 
@@ -92,9 +92,9 @@ class IMAPProvider(BaseEmailProvider):
             for a in (msg.attachments or [])
         ]
 
-        received_at = msg.date or datetime.now(timezone.utc)
+        received_at = msg.date or datetime.now(UTC)
         if received_at.tzinfo is None:
-            received_at = received_at.replace(tzinfo=timezone.utc)
+            received_at = received_at.replace(tzinfo=UTC)
 
         return Email(
             provider=self.provider_type,

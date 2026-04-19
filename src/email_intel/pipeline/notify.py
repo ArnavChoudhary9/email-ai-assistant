@@ -19,22 +19,22 @@ def maybe_send_telegram(
     email: Email,
     extraction: Extraction,
     *,
-    calendar_added: bool = False,
+    pending_events: int = 0,
 ) -> bool:
     """Send a Telegram alert if rules match and we haven't already sent one.
 
-    `calendar_added` appends a "Calendar added." line when the calendar stage
-    actually created events for this email, matching the PRD §3.4 template.
-
-    Returns True if a message was sent. Idempotent across restarts via the
-    notifications table.
+    Idempotent across restarts via the `notifications` table. Skips silently
+    if no authorized chats are registered yet.
     """
     if not should_alert(extraction):
         return False
     if repo.telegram_already_sent(session, email_row.id):
         log.debug("Telegram already sent for email_id=%s; skipping", email_row.id)
         return False
+    if not notifier.has_recipients:
+        log.debug("No authorized Telegram chats; skipping alert for email_id=%s", email_row.id)
+        return False
 
-    notifier.send(format_message(email, extraction, calendar_added=calendar_added))
+    notifier.send(format_message(email, extraction, pending_events=pending_events))
     repo.mark_telegram_sent(session, email_row.id)
     return True

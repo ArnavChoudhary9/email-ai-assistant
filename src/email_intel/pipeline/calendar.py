@@ -1,54 +1,64 @@
-"""Convert extracted structured data into Google Calendar events.
+"""Convert extracted structured data into pending Google Calendar events.
 
-Rules (PRD §3.5, §14):
-  - Create events for `extraction.calendar_events` (explicit LLM output).
-  - Create a meeting event when `extraction.meeting.exists` and we have a date.
-  - Create a deadline event when `extraction.deadline` is present and no
-    meeting was already covered by the same date.
-  - Dedupe per-email via the `calendar_events` table: if this email already
-    produced any calendar events, skip further creates for that email.
+Flow (post-Phase 2):
+  - Build event bodies from extraction (meeting, deadline, calendar_events).
+  - Insert each as a `pending_events` row (deduped by fingerprint).
+  - The Telegram bot prompts the user and, on approval, creates the real
+    Google Calendar event. This module no longer calls insert_event directly.
+
+Time handling:
+  - Naive datetimes coming out of the LLM are interpreted in the configured
+    app timezone (default Asia/Kolkata) — NOT UTC. This fixes the bug where
+    "3 PM" in an IST email was being scheduled at 15:00 UTC = 20:30 IST.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
-from email_intel.integrations.google_calendar import GoogleCalendarClient
 from email_intel.models import Email, Extraction
-from email_intel.storage import repo
-from email_intel.storage.schema import EmailRow
+from email_intel.pipeline import pending
+from email_intel.storage.schema import EmailRow, PendingEventRow
 
 log = logging.getLogger(__name__)
 
 
-def build_events(email: Email, extraction: Extraction) -> list[dict[str, Any]]:
+def build_events(
+    email: Email,
+    extraction: Extraction,
+    *,
+    app_timezone: str = "Asia/Kolkata",
+) -> list[dict[str, Any]]:
     """Build Google Calendar API event bodies from an Extraction.
 
-    Each body matches https://developers.google.com/calendar/api/v3/reference/events#resource
+    Bodies include title, description, start/end (tz-aware), location, reminders.
     """
+    tz = ZoneInfo(app_timezone)
     events: list[dict[str, Any]] = []
     source_desc = f"From: {email.sender}\nSubject: {email.subject}"
 
     for ev in extraction.calendar_events:
-        start = _parse_iso(ev.start)
+        start = _parse_iso(ev.start, tz)
         if start is None:
             continue
-        end = _parse_iso(ev.end) or (start + timedelta(hours=1))
+        end = _parse_iso(ev.end, tz) or (start + timedelta(hours=1))
         events.append(
             _event_body(
                 title=ev.title or extraction.summary or email.subject,
                 start=start,
                 end=end,
                 description=_join_desc(ev.description, source_desc),
+                timezone_name=app_timezone,
             )
         )
 
     if extraction.meeting.exists:
-        dt = _combine_date_time(extraction.meeting.date, extraction.meeting.time)
+        dt = _combine_date_time(extraction.meeting.date, extraction.meeting.time, tz)
         if dt is not None:
             title = f"Meeting: {email.subject[:120]}" if email.subject else "Meeting"
             events.append(
@@ -58,11 +68,12 @@ def build_events(email: Email, extraction: Extraction) -> list[dict[str, Any]]:
                     end=dt + timedelta(hours=1),
                     description=source_desc,
                     location=extraction.meeting.location or "",
+                    timezone_name=app_timezone,
                 )
             )
 
     if extraction.deadline:
-        dt = _parse_iso(extraction.deadline)
+        dt = _parse_iso(extraction.deadline, tz)
         if dt is not None and not _covered_by_existing(dt, events):
             title = f"Deadline: {email.subject[:120]}" if email.subject else "Deadline"
             events.append(
@@ -71,52 +82,47 @@ def build_events(email: Email, extraction: Extraction) -> list[dict[str, Any]]:
                     start=dt,
                     end=dt + timedelta(minutes=30),
                     description=source_desc,
+                    timezone_name=app_timezone,
                 )
             )
 
     return events
 
 
-def sync_for_email(
+def propose_events_for_email(
     *,
     session: Session,
-    client: GoogleCalendarClient | None,
     email_row: EmailRow,
     email: Email,
     extraction: Extraction,
-) -> int:
-    """Create calendar events for this email if client is available.
+    app_timezone: str = "Asia/Kolkata",
+) -> list[PendingEventRow]:
+    """Create pending-event rows for this email; return only the NEW ones.
 
-    Returns the number of events successfully created. Idempotent per-email:
-    if this email already has calendar rows, skip.
+    Rows that dedup against existing fingerprints are skipped (not returned),
+    so the caller only prompts the user about genuinely new events.
     """
-    if client is None:
-        return 0
-    if repo.count_calendar_events_for_email(session, email_row.id) > 0:
-        log.debug("Calendar events already created for email_id=%s; skipping", email_row.id)
-        return 0
-
-    bodies = build_events(email, extraction)
+    bodies = build_events(email, extraction, app_timezone=app_timezone)
     if not bodies:
-        return 0
+        return []
 
-    created = 0
+    new_rows: list[PendingEventRow] = []
     for body in bodies:
-        try:
-            result = client.insert_event(body)
-        except Exception:
-            log.exception("Calendar insert failed for email_id=%s; continuing", email_row.id)
-            continue
-        event_id = result.get("id") if isinstance(result, dict) else None
-        repo.record_calendar_event(session, email_row.id, event_id)
-        created += 1
-        log.info(
-            "Calendar event created: email_id=%s google_event_id=%s title=%r",
-            email_row.id,
-            event_id,
-            body.get("summary"),
+        start_iso = body.get("start", {}).get("dateTime", "")
+        end_iso = body.get("end", {}).get("dateTime", "")
+        title = str(body.get("summary", ""))
+        row, is_new = pending.propose(
+            session,
+            email_id=email_row.id,
+            title=title,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            timezone_name=app_timezone,
+            event_body=body,
         )
-    return created
+        if is_new:
+            new_rows.append(row)
+    return new_rows
 
 
 def _event_body(
@@ -126,12 +132,13 @@ def _event_body(
     end: datetime,
     description: str = "",
     location: str = "",
+    timezone_name: str = "Asia/Kolkata",
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "summary": title[:250],
         "description": description,
-        "start": {"dateTime": _isoformat(start), "timeZone": "UTC"},
-        "end": {"dateTime": _isoformat(end), "timeZone": "UTC"},
+        "start": {"dateTime": _isoformat(start), "timeZone": timezone_name},
+        "end": {"dateTime": _isoformat(end), "timeZone": timezone_name},
         "reminders": {
             "useDefault": False,
             "overrides": [
@@ -150,15 +157,14 @@ def _join_desc(*parts: str) -> str:
 
 
 def _isoformat(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
 
 
-def _parse_iso(value: str) -> datetime | None:
-    """Parse an ISO-ish date/time string. Returns None if unparseable or empty.
+def _parse_iso(value: str, default_tz: ZoneInfo) -> datetime | None:
+    """Parse an ISO-ish date/time string into a tz-aware datetime.
 
-    Accepts trailing Z, bare dates (YYYY-MM-DD), and datetime strings.
+    Naive datetimes are attached to `default_tz` (not UTC), fixing the wrong-
+    time scheduling bug.
     """
     if not value:
         return None
@@ -172,11 +178,11 @@ def _parse_iso(value: str) -> datetime | None:
             return None
         parsed = datetime.combine(d, time(9, 0))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=default_tz)
     return parsed
 
 
-def _combine_date_time(date_str: str, time_str: str) -> datetime | None:
+def _combine_date_time(date_str: str, time_str: str, default_tz: ZoneInfo) -> datetime | None:
     if not date_str:
         return None
     try:
@@ -189,7 +195,7 @@ def _combine_date_time(date_str: str, time_str: str) -> datetime | None:
             t = time.fromisoformat(time_str.strip())
         except ValueError:
             pass
-    return datetime.combine(d, t, tzinfo=timezone.utc)
+    return datetime.combine(d, t, tzinfo=default_tz)
 
 
 def _covered_by_existing(dt: datetime, events: list[dict[str, Any]]) -> bool:
@@ -197,7 +203,10 @@ def _covered_by_existing(dt: datetime, events: list[dict[str, Any]]) -> bool:
     target = dt.date()
     for ev in events:
         start_iso = ev.get("start", {}).get("dateTime", "")
-        existing = _parse_iso(start_iso)
-        if existing is not None and existing.date() == target:
+        try:
+            existing = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if existing.date() == target:
             return True
     return False

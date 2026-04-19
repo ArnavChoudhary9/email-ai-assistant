@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -42,7 +42,7 @@ def make_email(
         message_id=message_id or raw_hash,
         sender=sender,
         subject=subject,
-        received_at=received_at or datetime.now(timezone.utc),
+        received_at=received_at or datetime.now(UTC),
         body_text=body,
         body_html=body_html,
         headers=headers or {},

@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from email_intel.integrations.openrouter import OpenRouterClient, complete_with_fallback
 from email_intel.models import Email, Extraction
 from email_intel.pipeline.parse import truncate_for_llm
-from email_intel.prompts.extraction import SYSTEM_PROMPT, user_prompt
+from email_intel.prompts.extraction import system_prompt, user_prompt
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ def extract(
     *,
     primary_model: str,
     fallback_model: str | None,
+    app_timezone: str = "Asia/Kolkata",
 ) -> Extraction:
     """Run the LLM extraction step. Returns a validated Extraction."""
     trimmed = truncate_for_llm(body)
@@ -28,12 +29,13 @@ def extract(
         received_at=email.received_at.isoformat(),
         body=trimmed,
     )
+    system = system_prompt(app_timezone)
 
     raw = complete_with_fallback(
         client=client,
         primary_model=primary_model,
         fallback_model=fallback_model,
-        system=SYSTEM_PROMPT,
+        system=system,
         user=user,
     )
 
@@ -41,7 +43,6 @@ def extract(
         return Extraction.model_validate(raw)
     except ValidationError as e:
         log.warning("Extraction JSON failed validation (%s); attempting repair", e)
-        # One repair shot: tell the model exactly what went wrong.
         repair_user = (
             f"The previous response was invalid: {e}\n"
             f"Original input:\n{user}\n\n"
@@ -51,7 +52,7 @@ def extract(
             client=client,
             primary_model=primary_model,
             fallback_model=fallback_model,
-            system=SYSTEM_PROMPT,
+            system=system,
             user=repair_user,
         )
         return Extraction.model_validate(raw2)
